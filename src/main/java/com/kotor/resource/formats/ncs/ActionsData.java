@@ -66,7 +66,15 @@ public class ActionsData {
       // That is brittle and can desync action indices, breaking stack typing and
       // round-trip fidelity. Instead, bind signatures to their explicit numeric
       // indices in the comment headers.
-      Pattern header = Pattern.compile("^\\s*//\\s*(\\d+)\\b.*$");
+      // Only treat real action headers as indices. Many nwscript files contain
+      // enumerated doc lists like "// 6) ..." which must NOT be treated as
+      // an action index, otherwise signatures get mis-assigned (breaks decompile).
+      // Accept common header styles:
+      // - "// 123:" (K1/K2)
+      // - "// 123." (some vendor variants)
+      // - "// 123"  (some tool-distributed nwscript files)
+      // Reject enumerated lists like "// 6) ..." which otherwise desync indices.
+      Pattern header = Pattern.compile("^\\s*//\\s*(\\d+)\\s*(?:[\\.:]\\s*.*)?$");
       Pattern sig = Pattern.compile("^\\s*(\\w+)\\s+(\\w+)\\s*\\((.*)\\)\\s*;?.*");
 
       String str;

@@ -17,7 +17,7 @@
 #   .\scripts\run_tests.ps1 -NoProfiling                      # Disable profiling
 param(
     [switch]$NoResume = $false,
-    [int]$TimeoutSeconds = 0,
+    [int]$TimeoutSeconds = 120,
     [string]$LogFile = "test_output.log",
     [switch]$SuppressStderr = $false,
     [switch]$BatchOutput = $false,
@@ -354,7 +354,17 @@ if (-not $NoProfiling) {
 # Build Java arguments
 $javaArgs = @()
 if ($NoResume) {
-    $javaArgs = @("--no-resume")
+    $javaArgs += "--no-resume"
+}
+
+# Keep long runs within the runner timeout by giving the Java test harness its own
+# time budget and periodic progress saves. This avoids the outer job timeout killing
+# the process without a resume point.
+$maxSecondsBudget = 0
+$saveProgressEvery = 250
+if ($TimeoutSeconds -gt 0) {
+    $maxSecondsBudget = [Math]::Max(5, $TimeoutSeconds - 10)
+    $javaArgs += @("--max-seconds", $maxSecondsBudget.ToString(), "--save-progress-every", $saveProgressEvery.ToString())
 }
 
 # Prepare JAVA_TOOL_OPTIONS for profiling
@@ -367,7 +377,7 @@ if ($hprofAvailable) {
 
 # Create a scriptblock that runs java and outputs directly (for job execution)
 $scriptBlock = {
-    param($repoRoot, $cp, $profilePath, $noResume, $useHprof, $suppressStderr)
+    param($repoRoot, $cp, $profilePath, $noResume, $useHprof, $suppressStderr, $maxSecondsBudget, $saveProgressEvery)
     Set-Location -LiteralPath $repoRoot
     if ($useHprof) {
         $env:JAVA_TOOL_OPTIONS = "-agentlib:hprof=cpu=times,file=$profilePath"
@@ -376,7 +386,10 @@ $scriptBlock = {
     }
     $javaArgs = @()
     if ($noResume) {
-        $javaArgs = @("--no-resume")
+        $javaArgs += "--no-resume"
+    }
+    if ($maxSecondsBudget -gt 0) {
+        $javaArgs += @("--max-seconds", $maxSecondsBudget.ToString(), "--save-progress-every", $saveProgressEvery.ToString())
     }
     if ($suppressStderr) {
         & java -cp $cp com.kotor.resource.formats.ncs.NCSDecompCLIRoundTripTest @javaArgs 2>$null
@@ -438,116 +451,174 @@ if ($DirectExecution) {
     exit 0
 }
 
-# Start job (only if not using direct execution)
-$job = Start-Job -ScriptBlock $scriptBlock -ArgumentList $repoRoot, $cp, $profileTextFile, $NoResume, $hprofAvailable, $SuppressStderr
-$javaExitCode = $null
+function Invoke-RoundTripChunk {
+    param(
+        [string]$RepoRoot,
+        [string]$Cp,
+        [string]$ProfilePath,
+        [bool]$NoResumeFlag,
+        [bool]$UseHprofFlag,
+        [bool]$SuppressStderrFlag,
+        [int]$TimeoutSecondsLocal,
+        [int]$MaxSecondsBudgetLocal,
+        [int]$SaveProgressEveryLocal
+    )
 
-if ($BatchOutput) {
-    # Batch output mode: wait for job completion and output all at once (like run_tests_with_timeout.ps1)
-    if ($TimeoutSeconds -gt 0) {
-        $result = Wait-Job -Job $job -Timeout $TimeoutSeconds
-        if ($null -eq $result) {
-            Write-ToConsoleAndLog -Message "`nTIMEOUT: Tests exceeded $TimeoutSeconds seconds. Killing process..." -ForegroundColor Red
-            Stop-Job -Job $job
-            Remove-Job -Job $job -Force
-            Close-LogFile
-            exit 124
-        }
-    } else {
-        $result = Wait-Job -Job $job
-    }
+    $timeBudgetReached = $false
+    $allTestsPassed = $false
+    $javaExitCode = $null
 
-    # Get all output at once
-    $output = Receive-Job -Job $job
-    if ($output) {
-        foreach ($line in $output) {
-            $text = $line.ToString()
-            if ($text -match '^###JAVA_EXIT_CODE:(\d+)###$') {
-                $javaExitCode = [int]$matches[1]
-                continue
-            }
-            Write-RawToConsoleAndLog -Message $text
-        }
-    }
-} else {
-    # Real-time streaming mode (default): monitor job and receive output in real-time
-    # Output is streamed directly to console as it becomes available
-    $completed = $false
-    $startTime = Get-Date
-    $timeout = if ($TimeoutSeconds -gt 0) { New-TimeSpan -Seconds $TimeoutSeconds } else { $null }
+    $job = Start-Job -ScriptBlock $scriptBlock -ArgumentList $RepoRoot, $Cp, $ProfilePath, $NoResumeFlag, $UseHprofFlag, $SuppressStderrFlag, $MaxSecondsBudgetLocal, $SaveProgressEveryLocal
 
-    while (-not $completed) {
-        # Check for timeout if specified
-        if ($null -ne $timeout) {
-            $elapsed = (Get-Date) - $startTime
-            if ($elapsed -gt $timeout) {
-                Write-ToConsoleAndLog -Message "`nTIMEOUT: Tests exceeded $TimeoutSeconds seconds. Killing process..." -ForegroundColor Red
+    if ($BatchOutput) {
+        if ($TimeoutSecondsLocal -gt 0) {
+            $result = Wait-Job -Job $job -Timeout $TimeoutSecondsLocal
+            if ($null -eq $result) {
+                Write-ToConsoleAndLog -Message "`nTIMEOUT: Tests exceeded $TimeoutSecondsLocal seconds. Killing process..." -ForegroundColor Red
                 Stop-Job -Job $job
                 Remove-Job -Job $job -Force
-                Close-LogFile
-                exit 124
+                return [pscustomobject]@{
+                    FinalJobState = "Stopped"
+                    JavaExitCode = 124
+                    TimeBudgetReached = $false
+                    AllTestsPassed = $false
+                }
             }
+        } else {
+            $result = Wait-Job -Job $job
         }
 
-        # Receive any available output and write directly to console (raw, no filtering)
-        # Receive-Job captures both stdout and stderr from the job
         $output = Receive-Job -Job $job
         if ($output) {
-            # Output directly to console - preserves both stdout and stderr
             foreach ($line in $output) {
                 $text = $line.ToString()
                 if ($text -match '^###JAVA_EXIT_CODE:(\d+)###$') {
                     $javaExitCode = [int]$matches[1]
                     continue
                 }
+                if ($text -match '^=== TIME BUDGET REACHED ===$') { $timeBudgetReached = $true }
+                if ($text -match '^ALL TESTS PASSED!$') { $allTestsPassed = $true }
                 Write-RawToConsoleAndLog -Message $text
             }
         }
+    } else {
+        $completed = $false
+        $startTime = Get-Date
+        $timeout = if ($TimeoutSecondsLocal -gt 0) { New-TimeSpan -Seconds $TimeoutSecondsLocal } else { $null }
 
-        # Check if job is complete
-        if ($job.State -eq "Completed" -or $job.State -eq "Failed" -or $job.State -eq "Stopped") {
-            $completed = $true
-        } else {
-            # Small delay to avoid busy-waiting
-            Start-Sleep -Milliseconds 50
-        }
-    }
-
-    # Get any remaining output that might have been buffered
-    $remainingOutput = Receive-Job -Job $job
-    if ($remainingOutput) {
-        foreach ($line in $remainingOutput) {
-            $text = $line.ToString()
-            if ($text -match '^###JAVA_EXIT_CODE:(\d+)###$') {
-                $javaExitCode = [int]$matches[1]
-                continue
+        while (-not $completed) {
+            if ($null -ne $timeout) {
+                $elapsed = (Get-Date) - $startTime
+                if ($elapsed -gt $timeout) {
+                    Write-ToConsoleAndLog -Message "`nTIMEOUT: Tests exceeded $TimeoutSecondsLocal seconds. Killing process..." -ForegroundColor Red
+                    Stop-Job -Job $job
+                    Remove-Job -Job $job -Force
+                    return [pscustomobject]@{
+                        FinalJobState = "Stopped"
+                        JavaExitCode = 124
+                        TimeBudgetReached = $false
+                        AllTestsPassed = $false
+                    }
+                }
             }
-            Write-RawToConsoleAndLog -Message $text
+
+            $output = Receive-Job -Job $job
+            if ($output) {
+                foreach ($line in $output) {
+                    $text = $line.ToString()
+                    if ($text -match '^###JAVA_EXIT_CODE:(\d+)###$') {
+                        $javaExitCode = [int]$matches[1]
+                        continue
+                    }
+                    if ($text -match '^=== TIME BUDGET REACHED ===$') { $timeBudgetReached = $true }
+                    if ($text -match '^ALL TESTS PASSED!$') { $allTestsPassed = $true }
+                    Write-RawToConsoleAndLog -Message $text
+                }
+            }
+
+            if ($job.State -eq "Completed" -or $job.State -eq "Failed" -or $job.State -eq "Stopped") {
+                $completed = $true
+            } else {
+                Start-Sleep -Milliseconds 50
+            }
         }
+
+        $remainingOutput = Receive-Job -Job $job
+        if ($remainingOutput) {
+            foreach ($line in $remainingOutput) {
+                $text = $line.ToString()
+                if ($text -match '^###JAVA_EXIT_CODE:(\d+)###$') {
+                    $javaExitCode = [int]$matches[1]
+                    continue
+                }
+                if ($text -match '^=== TIME BUDGET REACHED ===$') { $timeBudgetReached = $true }
+                if ($text -match '^ALL TESTS PASSED!$') { $allTestsPassed = $true }
+                Write-RawToConsoleAndLog -Message $text
+            }
+        }
+    }
+
+    $finalJobState = $job.State
+    Remove-Job -Job $job -Force
+
+    return [pscustomobject]@{
+        FinalJobState = $finalJobState
+        JavaExitCode = $javaExitCode
+        TimeBudgetReached = $timeBudgetReached
+        AllTestsPassed = $allTestsPassed
     }
 }
 
-# Capture final state before cleanup
-$finalJobState = $job.State
+# Auto-continue: when using resume + a time budget, repeatedly invoke the Java runner until it finishes.
+# This allows a single `.\scripts\run_tests.ps1` invocation to process the entire suite without manual restarts.
+$maxChunks = 10000
+$chunk = 0
+$lastChunkResult = $null
 
-# Clean up job
-Remove-Job -Job $job -Force
+while ($true) {
+    $chunk++
+    if ($chunk -gt $maxChunks) {
+        Write-ToConsoleAndLog -Message "Error: Exceeded maxChunks=$maxChunks. Aborting to avoid infinite loop." -ForegroundColor Red
+        Close-LogFile
+        exit 1
+    }
 
-# Check exit code/state.
-if ($finalJobState -eq "Failed" -or $finalJobState -eq "Stopped") {
-    Close-LogFile
-    exit 1
+    $lastChunkResult = Invoke-RoundTripChunk -RepoRoot $repoRoot -Cp $cp -ProfilePath $profileTextFile `
+        -NoResumeFlag $NoResume -UseHprofFlag $hprofAvailable -SuppressStderrFlag $SuppressStderr `
+        -TimeoutSecondsLocal $TimeoutSeconds -MaxSecondsBudgetLocal $maxSecondsBudget -SaveProgressEveryLocal $saveProgressEvery
+
+    if ($lastChunkResult.FinalJobState -eq "Failed" -or $lastChunkResult.FinalJobState -eq "Stopped") {
+        Close-LogFile
+        exit 1
+    }
+    if ($null -eq $lastChunkResult.JavaExitCode) {
+        Write-ToConsoleAndLog -Message "Warning: Could not determine Java exit code (job did not emit sentinel). Treating as failure." -ForegroundColor Yellow
+        Close-LogFile
+        exit 1
+    }
+    if ($lastChunkResult.JavaExitCode -ne 0) {
+        Write-ToConsoleAndLog -Message "Java process exited with code: $($lastChunkResult.JavaExitCode)" -ForegroundColor Red
+        Close-LogFile
+        exit $lastChunkResult.JavaExitCode
+    }
+
+    # Exit conditions:
+    # - NoResume: we ran exactly once (no checkpointing/auto-resume).
+    # - AllTestsPassed: suite completed.
+    # - No timeout budget or no budget marker: treat as completed.
+    if ($NoResume) { break }
+    if ($lastChunkResult.AllTestsPassed) { break }
+    if ($TimeoutSeconds -le 0) { break }
+
+    if ($lastChunkResult.TimeBudgetReached) {
+        Write-ToConsoleAndLog -Message "Time budget chunk complete. Continuing..." -ForegroundColor Gray
+        continue
+    }
+
+    break
 }
-if ($null -eq $javaExitCode) {
-    Write-ToConsoleAndLog -Message "Warning: Could not determine Java exit code (job did not emit sentinel). Treating as failure." -ForegroundColor Yellow
-    Close-LogFile
-    exit 1
-}
-if ($javaExitCode -ne 0) {
-    Write-ToConsoleAndLog -Message "Java process exited with code: $javaExitCode" -ForegroundColor Red
-    Close-LogFile
-    exit $javaExitCode
-}
+
+$javaExitCode = $lastChunkResult.JavaExitCode
 
 # Analyze profile if it exists and hprof was used
 if ($hprofAvailable) {

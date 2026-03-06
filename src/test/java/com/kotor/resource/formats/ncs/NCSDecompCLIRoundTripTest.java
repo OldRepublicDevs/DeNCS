@@ -71,6 +71,10 @@ import java.util.concurrent.TimeUnit;
  * - Testing code is for validation, not for altering broken decompiled output in any way
  */
 public class NCSDecompCLIRoundTripTest {
+   /** Optional time budget for CLI runs (0 = unlimited). */
+   private long maxSuiteNanos = 0L;
+   /** How often to persist progress during long runs (<=0 disables). */
+   private int saveProgressEvery = 200;
 
    /**
     * Exception thrown when the original source file fails to compile.
@@ -186,6 +190,19 @@ public class NCSDecompCLIRoundTripTest {
    private static final Path COMPILE_TEMP_ROOT = TEST_WORK_DIR.resolve("compile-temp");
 
    private static final Duration PROC_TIMEOUT = Duration.ofSeconds(25);
+
+   /**
+    * Cache which game flavor (k1/k2) is currently staged as tools/nwscript.nss.
+    * This avoids copying nwscript.nss for every single compilation.
+    */
+   private static volatile String stagedNwscriptGameFlag = null;
+
+   /**
+    * Cache of include files already staged into the compiler directory, keyed by
+    * "{gameFlag}:{includeNameLower}".
+    */
+   private static final java.util.Set<String> stagedIncludes =
+         java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<String, Boolean>());
 
    // Performance tracking
    private static final Map<String, Long> operationTimes = new HashMap<>();
@@ -1188,6 +1205,80 @@ public class NCSDecompCLIRoundTripTest {
    }
 
    /**
+    * Ensure the compiler working directory contains the correct {@code nwscript.nss}
+    * for the current game flavor. We keep this file staged across the entire run
+    * to avoid re-copying it for every compilation.
+    */
+   private static void ensureCompilerDirNwscript(Path compilerDir, Path nwscriptSource, String gameFlag)
+         throws IOException {
+      if (compilerDir == null) {
+         throw new IOException("compilerDir is null");
+      }
+      Path dest = compilerDir.resolve("nwscript.nss");
+
+      // Fast path: if we already staged the right game and the file exists, do nothing.
+      if (gameFlag != null && gameFlag.equals(stagedNwscriptGameFlag) && Files.isRegularFile(dest)) {
+         return;
+      }
+
+      // Copy/overwrite to guarantee correctness when switching between k1/k2 in the same suite.
+      Files.copy(nwscriptSource, dest, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+      stagedNwscriptGameFlag = gameFlag;
+   }
+
+   /**
+    * Stage include files referenced by {@code originalSourcePath} into {@code compilerDir}.
+    * This is best-effort and cached across the run. Vanilla_KOTOR_Script_Source is typically
+    * include-free, but this keeps the compiler invocation robust for edge cases.
+    */
+   private static void stageIncludesIntoCompilerDir(Path stagedSourcePath, Path originalSourcePath, String gameFlag,
+         Path compilerDir) {
+      try {
+         java.util.ArrayDeque<Path> work = new java.util.ArrayDeque<>();
+         java.util.Set<Path> visited = new java.util.HashSet<>();
+         work.add(originalSourcePath);
+
+         while (!work.isEmpty()) {
+            Path current = work.removeFirst();
+            if (current == null || !visited.add(current)) {
+               continue;
+            }
+            if (!Files.isRegularFile(current)) {
+               continue;
+            }
+
+            List<String> includes = extractIncludes(current);
+            for (String includeName : includes) {
+               if (includeName == null || includeName.trim().isEmpty()) {
+                  continue;
+               }
+               String normalized = includeName.trim();
+               String key = (gameFlag == null ? "" : gameFlag) + ":" + normalized.toLowerCase();
+               if (stagedIncludes.contains(key)) {
+                  continue;
+               }
+
+               Path includeFile = findIncludeFile(normalized, current, gameFlag);
+               if (includeFile == null || !Files.exists(includeFile)) {
+                  // Don't fail compilation up-front; let the compiler produce its normal error.
+                  stagedIncludes.add(key);
+                  continue;
+               }
+
+               // Copy into compiler directory, preserving the include name/path as requested.
+               copyIncludeFile(normalized, includeFile, compilerDir);
+               stagedIncludes.add(key);
+
+               // Also scan the include itself for nested includes.
+               work.add(includeFile);
+            }
+         }
+      } catch (Exception ignored) {
+         // Best-effort staging only; compilation will still surface missing includes.
+      }
+   }
+
+   /**
     * Filters out functions from the expanded original that aren't present in the decompiled output.
     * This handles cases where included files have functions that aren't compiled into the NCS bytecode.
     *
@@ -1631,137 +1722,80 @@ public class NCSDecompCLIRoundTripTest {
          throw new IllegalArgumentException("Invalid game flag: " + gameFlag + " (expected 'k1' or 'k2')");
       }
 
-      // Create temp directory with source file and all includes
-      Path tempDir = null;
-      Path tempSourceFile = null;
-      try {
-         tempDir = setupTempCompileDir(originalNssPath, gameFlag);
-         tempSourceFile = tempDir.resolve(originalNssPath.getFileName());
+      // Performance: avoid creating/deleting a unique temp directory per compile.
+      // Instead, compile from the compiler's directory (tools/) and copy the source file there.
+      // This matches how legacy nwnnsscomp variants search for nwscript/includes and dramatically
+      // reduces filesystem churn (which was the main bottleneck for full-suite runs).
+      Path compilerDir = NWN_COMPILER.toAbsolutePath().getParent();
+      if (compilerDir == null) {
+         throw new IOException("Compiler directory is null for: " + displayPath(NWN_COMPILER));
+      }
+      Files.createDirectories(compilerDir);
 
-         // Ensure nwscript.nss is in the temp directory (compiler's working directory)
-         // The compiler runs from tempDir, so it needs nwscript.nss there
-         Path tempNwscript = tempDir.resolve("nwscript.nss");
-         if (!Files.exists(tempNwscript) || !Files.isSameFile(nwscriptSource, tempNwscript)) {
-            Files.copy(nwscriptSource, tempNwscript, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-         }
+      // Ensure the correct nwscript.nss is present alongside the compiler.
+      ensureCompilerDirNwscript(compilerDir, nwscriptSource, gameFlag);
 
-         Files.createDirectories(compiledOut.getParent());
+      Files.createDirectories(compiledOut.getParent());
 
-         java.io.File compilerFile = NWN_COMPILER.toAbsolutePath().toFile();
-         java.io.File sourceFile = tempSourceFile.toAbsolutePath().toFile();
-         java.io.File outputFile = compiledOut.toAbsolutePath().toFile();
-         boolean isK2 = "k2".equals(gameFlag);
+      // Copy compile input next to compiler so includes (if any) can be found.
+      Path stagedSource = compilerDir.resolve(originalNssPath.getFileName());
+      Files.copy(originalNssPath, stagedSource, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
 
-         NwnnsscompConfig config = new NwnnsscompConfig(compilerFile, sourceFile, outputFile, isK2);
-         // Don't use -i flag - compiler expects includes in same directory as source
-         // All includes are already copied to tempDir alongside the source file
-         String[] cmd = config.getCompileArgs(compilerFile.getAbsolutePath());
+      // Best-effort: stage any includes referenced by this file (and their dependencies) once.
+      // Vanilla_KOTOR_Script_Source typically has no #include usage, but this keeps the runner robust.
+      stageIncludesIntoCompilerDir(stagedSource, originalNssPath, gameFlag, compilerDir);
 
-         // Log compilation command and args (but show original path in the log)
-         System.out.print(" (");
-         String compilerPathStr = compilerFile.getAbsolutePath();
-         String sourcePathStr = sourceFile.getAbsolutePath();
-         String outputPathStr = outputFile.getAbsolutePath();
-         String displaySource = displayPath(originalNssPath);
-         String displayOutput = displayPath(compiledOut);
-         String displayCompiler = displayPath(NWN_COMPILER);
-         for (int i = 0; i < cmd.length; i++) {
-            if (i > 0)
-               System.out.print(" ");
-            String arg = cmd[i];
-            // Replace temp path with original path in log output for readability
-            if (arg.equals(sourcePathStr)) {
-               arg = displaySource;
-            } else if (arg.equals(outputPathStr)) {
-               arg = displayOutput;
-            } else if (arg.equals(compilerPathStr)) {
-               arg = displayCompiler;
-            }
-            // Quote arguments with spaces
-            if (arg.contains(" ") && !arg.startsWith("\"")) {
-               System.out.print("\"" + arg + "\"");
-            } else {
-               System.out.print(arg);
-            }
-         }
-         System.out.print(")");
+      java.io.File compilerFile = NWN_COMPILER.toAbsolutePath().toFile();
+      java.io.File sourceFile = stagedSource.toAbsolutePath().toFile();
+      java.io.File outputFile = compiledOut.toAbsolutePath().toFile();
+      boolean isK2 = "k2".equals(gameFlag);
 
-         ProcessBuilder pb = new ProcessBuilder(cmd);
-         // Set working directory to temp directory so includes are found
-         pb.directory(tempDir.toFile());
-         pb.redirectErrorStream(true);
-         Process proc = pb.start();
+      NwnnsscompConfig config = new NwnnsscompConfig(compilerFile, sourceFile, outputFile, isK2);
+      String[] cmd = config.getCompileArgs(compilerFile.getAbsolutePath());
 
-         java.io.BufferedReader reader = new java.io.BufferedReader(
-               new java.io.InputStreamReader(proc.getInputStream()));
-         StringBuilder output = new StringBuilder();
+      ProcessBuilder pb = new ProcessBuilder(cmd);
+      pb.directory(compilerDir.toFile());
+      pb.redirectErrorStream(true);
+      Process proc = pb.start();
+
+      StringBuilder output = new StringBuilder();
+      try (java.io.BufferedReader reader = new java.io.BufferedReader(
+            new java.io.InputStreamReader(proc.getInputStream(), StandardCharsets.UTF_8))) {
          String line;
          while ((line = reader.readLine()) != null) {
             output.append(line).append("\n");
          }
+      }
 
-         boolean finished = proc.waitFor(PROC_TIMEOUT.toMillis(), java.util.concurrent.TimeUnit.MILLISECONDS);
-         if (!finished) {
-            proc.destroyForcibly();
-            System.out.println(" ✗ TIMEOUT");
-            throw new RuntimeException("nwnnsscomp timed out for " + displayPath(originalNssPath));
+      boolean finished = proc.waitFor(PROC_TIMEOUT.toMillis(), java.util.concurrent.TimeUnit.MILLISECONDS);
+      if (!finished) {
+         proc.destroyForcibly();
+         System.out.println(" ✗ TIMEOUT");
+         try {
+            Files.deleteIfExists(stagedSource);
+         } catch (Exception ignored) {
          }
+         throw new RuntimeException("nwnnsscomp timed out for " + displayPath(originalNssPath));
+      }
 
-         int exitCode = proc.exitValue();
-         boolean fileExists = Files.isRegularFile(compiledOut);
+      int exitCode = proc.exitValue();
+      boolean fileExists = Files.isRegularFile(compiledOut);
 
-         if (exitCode != 0 || !fileExists) {
-            System.out.println(" ✗ FAILED");
-            String errorMsg = "nwnnsscomp failed (exit=" + exitCode + ", fileExists=" + fileExists + ") for "
-                  + displaySource;
-            if (output.length() > 0) {
-               // Show relevant error lines
-               String[] outputLines = output.toString().split("\n");
-               boolean foundError = false;
-               String tempSourceAbs = tempSourceFile.toAbsolutePath().toString();
-               String tempDirAbs = tempDir.toAbsolutePath().toString();
-               String displayTempDir = displayPath(tempDir);
-               String compiledAbs = compiledOut.toAbsolutePath().toString();
-               for (String outputLine : outputLines) {
-                  if (outputLine.toLowerCase().contains("error") ||
-                        outputLine.toLowerCase().contains("unable") ||
-                        outputLine.toLowerCase().contains("include")) {
-                     if (!foundError) {
-                        errorMsg += "\nCompiler errors:";
-                        foundError = true;
-                     }
-                     // Replace temp path with original path in error messages
-                     String displayLine = outputLine
-                           .replace(tempSourceAbs, displaySource)
-                           .replace(tempDirAbs, displayTempDir)
-                           .replace(compiledAbs, displayOutput)
-                           .replace(originalNssPath.toAbsolutePath().toString(), displaySource);
-                     errorMsg += "\n  " + displayLine;
-                  }
-               }
-               // If no errors found, show all output
-               if (!foundError && outputLines.length > 0) {
-                  String sanitizedOutput = output.toString()
-                        .replace(tempSourceAbs, displaySource)
-                        .replace(tempDirAbs, displayTempDir)
-                        .replace(compiledAbs, displayOutput)
-                        .replace(originalNssPath.toAbsolutePath().toString(), displaySource);
-                  errorMsg += "\nCompiler output:\n" + sanitizedOutput;
-               }
-            }
-            throw new RuntimeException(errorMsg);
+      // Always clean up the staged source file (never keep per-test inputs in tools/).
+      try {
+         Files.deleteIfExists(stagedSource);
+      } catch (Exception ignored) {
+      }
+
+      if (exitCode != 0 || !fileExists) {
+         System.out.println(" ✗ FAILED");
+         String displaySource = displayPath(originalNssPath);
+         String errorMsg = "nwnnsscomp failed (exit=" + exitCode + ", fileExists=" + fileExists + ") for "
+               + displaySource;
+         if (output.length() > 0) {
+            errorMsg += "\nCompiler output:\n" + output;
          }
-      } finally {
-         // Clean up temp directory
-         if (tempDir != null) {
-            try {
-               deleteDirectory(tempDir);
-            } catch (Exception e) {
-               // Log but don't fail on cleanup errors
-               System.err.println(
-                     "Warning: Failed to clean up temp directory " + displayPath(tempDir) + ": " + e.getMessage());
-            }
-         }
+         throw new RuntimeException(errorMsg);
       }
    }
 
@@ -3156,25 +3190,40 @@ public class NCSDecompCLIRoundTripTest {
       NCSDecompCLIRoundTripTest runner = new NCSDecompCLIRoundTripTest();
       int exitCode;
       boolean useResume = true;
+      // Basic CLI arg parsing (supports long-running chunked runs).
+      java.util.List<String> positional = new java.util.ArrayList<>();
+      Integer maxSeconds = null;
+      Integer saveEvery = null;
 
-      if (args.length > 0) {
-         if ("--no-resume".equals(args[0])) {
+      for (int i = 0; i < args.length; i++) {
+         String a = args[i];
+         if ("--no-resume".equals(a)) {
             useResume = false;
-            if (args.length > 1) {
-               // Single file test mode with --no-resume
-               String filename = args[1];
-               String gameFlag = args.length > 2 ? args[2] : "k1";
-               exitCode = runner.testSingleFile(filename, gameFlag);
-            } else {
-               // Full suite with --no-resume
-               exitCode = runner.runRoundTripSuite(useResume);
-            }
-         } else {
-            // Single file test mode
-            String filename = args[0];
-            String gameFlag = args.length > 1 ? args[1] : "k1";
-            exitCode = runner.testSingleFile(filename, gameFlag);
+            continue;
          }
+         if ("--max-seconds".equals(a) && i + 1 < args.length) {
+            maxSeconds = Integer.parseInt(args[++i]);
+            continue;
+         }
+         if ("--save-progress-every".equals(a) && i + 1 < args.length) {
+            saveEvery = Integer.parseInt(args[++i]);
+            continue;
+         }
+         positional.add(a);
+      }
+
+      if (maxSeconds != null && maxSeconds > 0) {
+         runner.maxSuiteNanos = (long) maxSeconds * 1_000_000_000L;
+      }
+      if (saveEvery != null) {
+         runner.saveProgressEvery = Math.max(0, saveEvery);
+      }
+
+      if (!positional.isEmpty()) {
+         // Single file test mode
+         String filename = positional.get(0);
+         String gameFlag = positional.size() > 1 ? positional.get(1) : "k1";
+         exitCode = runner.testSingleFile(filename, gameFlag);
       } else {
          // Full suite (with resume by default)
          exitCode = runner.runRoundTripSuite(useResume);
@@ -3313,6 +3362,7 @@ public class NCSDecompCLIRoundTripTest {
    private int runRoundTripSuite(boolean useResume) {
       resetPerformanceTracking();
       testStartTime = System.nanoTime();
+      final long suiteStartNanos = System.nanoTime();
 
       try {
          preflight();
@@ -3363,11 +3413,33 @@ public class NCSDecompCLIRoundTripTest {
             Path relPath = VANILLA_REPO_DIR.relativize(testCase.item.path);
             String displayPath = relPath.toString().replace('\\', '/');
 
+            // Optional time budget: persist progress and exit cleanly before external timeouts kill the process.
+            if (this.maxSuiteNanos > 0 && (System.nanoTime() - suiteStartNanos) > this.maxSuiteNanos) {
+               if (useResume) {
+                  saveResumePoint(displayPath);
+                  System.out.println();
+                  System.out.println("=== TIME BUDGET REACHED ===");
+                  System.out.println("Saved resume point: " + displayPath);
+                  System.out.println("Re-run to continue.");
+                  System.out.println();
+               }
+               printPerformanceSummary();
+               return 0;
+            }
+
             RoundTripResult result = roundTripSingleWithOutputCapture(testCase.item.path, testCase.item.gameFlag, testCase.item.scratchRoot);
 
             if (result.exception == null) {
                // Test passed - only show one-line summary
                System.out.println(String.format("[%d/%d] %s - PASS", testsProcessed, totalTests, displayPath));
+               // Periodically persist progress so long runs can be resumed without rerunning hours of tests.
+               if (useResume && this.saveProgressEvery > 0 && (testsProcessed % this.saveProgressEvery) == 0) {
+                  if (i + 1 < tests.size()) {
+                     Path nextRel = VANILLA_REPO_DIR.relativize(tests.get(i + 1).item.path);
+                     String nextDisplay = nextRel.toString().replace('\\', '/');
+                     saveResumePoint(nextDisplay);
+                  }
+               }
             } else if (result.exception instanceof SourceCompilationException) {
                // Original source file has compilation errors - skip this test and continue
                System.out.println(String.format("[%d/%d] %s - SKIP (original source has compilation errors)", testsProcessed, totalTests, displayPath));

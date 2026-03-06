@@ -69,9 +69,6 @@ test_profile.txt
 test-output.txt
 
 # Test working directories (created by tests)
-test-work/
-roundtrip-work/
-addcompile-temp/
 
 # Build artifacts (old locations - now using target/)
 dist-exe/
@@ -79,6 +76,7 @@ publish/
 build/
 build-gui/
 META-INF/
+*.ncs
 
 # Vendor dependencies (external code)
 vendor/
@@ -96,3 +94,4 @@ config/
 test-output.txt
 tmp/
 tests/
+test-work/

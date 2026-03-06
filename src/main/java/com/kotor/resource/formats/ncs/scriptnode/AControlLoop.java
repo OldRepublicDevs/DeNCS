@@ -33,9 +33,42 @@ public class AControlLoop extends ScriptRootNode {
       }
 
       String cond = this.condition.toString().trim();
-      boolean wrapped = cond.startsWith("(") && cond.endsWith(")");
+      // Check if the condition is TRULY wrapped in matching outer parentheses
+      // Simply checking startsWith("(") && endsWith(")") is wrong because
+      // "(A && B) && (C && D)" starts with ( and ends with ) but they don't match!
+      boolean wrapped = isWrappedInParens(cond);
       String wrappedCond = wrapped ? cond : "(" + cond + ")";
       return " " + wrappedCond;
+   }
+
+   /**
+    * Check if a string is wrapped in a MATCHING pair of outer parentheses.
+    * "(A && B)" -> true
+    * "(A && B) && (C && D)" -> false (the outer parens don't match)
+    * "A && B" -> false
+    */
+   private static boolean isWrappedInParens(String s) {
+      if (s == null || s.length() < 2) {
+         return false;
+      }
+      if (!s.startsWith("(") || !s.endsWith(")")) {
+         return false;
+      }
+      // Count parentheses depth - if we reach 0 before the end, they don't match
+      int depth = 0;
+      for (int i = 0; i < s.length(); i++) {
+         char c = s.charAt(i);
+         if (c == '(') {
+            depth++;
+         } else if (c == ')') {
+            depth--;
+            // If depth reaches 0 before the last character, the parens don't wrap the whole expression
+            if (depth == 0 && i < s.length() - 1) {
+               return false;
+            }
+         }
+      }
+      return depth == 0;
    }
 
    @Override

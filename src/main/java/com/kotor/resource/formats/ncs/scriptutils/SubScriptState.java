@@ -739,7 +739,18 @@ public class SubScriptState {
       if (this.state == 2) {
          Logger.trace("transformJump: state==2, creating AActionArgExp");
          this.state = 0;
-         AActionArgExp aarg = new AActionArgExp(this.getNextCommand(node), this.getPriorToDestCommand(node));
+         int start = this.getNextCommand(node);
+         int end = this.getPriorToDestCommand(node);
+         // Prefer using the actual previous command node to compute the end of the action-arg block.
+         // destPos-2 is not reliable across encodings and can truncate the block, causing the
+         // action argument statements to be emitted into the parent scope (breaking AssignCommand/DelayCommand).
+         if (dest != null) {
+            Node prev = NodeUtils.getPreviousCommand(dest, this.nodedata);
+            if (prev != null) {
+               end = this.nodedata.getPos(prev);
+            }
+         }
+         AActionArgExp aarg = new AActionArgExp(start, end);
          this.current.addChild(aarg);
          this.current = aarg;
       } else {
@@ -1223,11 +1234,17 @@ public class SubScriptState {
 
    public void transformLogii(ALogiiCommand node) {
       this.checkStart(node);
+      String op = NodeUtils.getOp(node);
       if (!this.current.hasChildren() && AIf.class.isInstance(this.current)
             && AIf.class.isInstance(this.current.parent())) {
          AIf right = (AIf) this.current;
          AIf left = (AIf) this.current.parent();
-         AConditionalExp conexp = new AConditionalExp(left.condition(), right.condition(), NodeUtils.getOp(node));
+         AExpression leftCond = left.condition();
+         AExpression rightCond = right.condition();
+         // For bytecode-perfect round-tripping: mark sub-expressions for explicit grouping
+         markForGroupingIfNeeded(leftCond, op);
+         markForGroupingIfNeeded(rightCond, op);
+         AConditionalExp conexp = new AConditionalExp(leftCond, rightCond, op);
          conexp.stackentry(this.stack.get(1));
          this.current = (ScriptRootNode) this.current.parent();
          ((AIf) this.current).condition(conexp);
@@ -1236,23 +1253,50 @@ public class SubScriptState {
          AExpression right = this.removeLastExp(false);
          if (!this.current.hasChildren() && AIf.class.isInstance(this.current)) {
             AExpression left = ((AIf) this.current).condition();
-            AConditionalExp conexp = new AConditionalExp(left, right, NodeUtils.getOp(node));
+            // For bytecode-perfect round-tripping: mark sub-expressions for explicit grouping
+            markForGroupingIfNeeded(left, op);
+            markForGroupingIfNeeded(right, op);
+            AConditionalExp conexp = new AConditionalExp(left, right, op);
             conexp.stackentry(this.stack.get(1));
             ((AIf) this.current).condition(conexp);
          } else if (!this.current.hasChildren() && AWhileLoop.class.isInstance(this.current)) {
             AExpression left = ((AWhileLoop) this.current).condition();
-            AConditionalExp conexp = new AConditionalExp(left, right, NodeUtils.getOp(node));
+            // For bytecode-perfect round-tripping: mark sub-expressions for explicit grouping
+            markForGroupingIfNeeded(left, op);
+            markForGroupingIfNeeded(right, op);
+            AConditionalExp conexp = new AConditionalExp(left, right, op);
             conexp.stackentry(this.stack.get(1));
             ((AWhileLoop) this.current).condition(conexp);
          } else {
             AExpression left = this.removeLastExp(false);
-            AConditionalExp conexp = new AConditionalExp(left, right, NodeUtils.getOp(node));
+            // For bytecode-perfect round-tripping: mark sub-expressions for explicit grouping
+            markForGroupingIfNeeded(left, op);
+            markForGroupingIfNeeded(right, op);
+            AConditionalExp conexp = new AConditionalExp(left, right, op);
             conexp.stackentry(this.stack.get(1));
             this.current.addChild(conexp);
          }
       }
 
       this.checkEnd(node);
+   }
+
+   /**
+    * For bytecode-perfect round-tripping: when combining expressions with && or ||,
+    * mark sub-expressions that are themselves && or || conditionals with forceParens.
+    * This ensures ((A && B) && (C && D)) round-trips correctly instead of becoming
+    * A && B && C && D, which compiles to different bytecode.
+    */
+   private void markForGroupingIfNeeded(AExpression expr, String parentOp) {
+      if (expr instanceof AConditionalExp) {
+         AConditionalExp condExpr = (AConditionalExp) expr;
+         String childOp = condExpr.op();
+         // If combining with same operator (e.g., && with &&), the child needs parens
+         // to preserve the original grouping structure in the bytecode
+         if (parentOp != null && parentOp.equals(childOp)) {
+            condExpr.forceParens(true);
+         }
+      }
    }
 
    public void transformBinary(ABinaryCommand node) {

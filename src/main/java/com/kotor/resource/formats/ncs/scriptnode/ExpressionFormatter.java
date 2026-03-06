@@ -90,6 +90,10 @@ final class ExpressionFormatter {
       String left = format(exp.left(), prec, Position.LEFT, op);
       String right = format(exp.right(), prec, Position.RIGHT, op);
       String rendered = left + " " + op + " " + right;
+      // For bytecode-perfect round-tripping: if forceParens is set, always wrap
+      if (exp.forceParens()) {
+         return "(" + rendered + ")";
+      }
       return wrapIfNeeded(rendered, prec, parentPrec, side, parentOp, op);
    }
 

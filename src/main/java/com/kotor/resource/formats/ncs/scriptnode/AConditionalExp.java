@@ -11,6 +11,7 @@ public class AConditionalExp extends ScriptNode implements AExpression {
    private AExpression right;
    private String op;
    private StackEntry stackentry;
+   private boolean forceParens; // For bytecode-perfect round-tripping of grouped expressions
 
    public AConditionalExp(AExpression left, AExpression right, String op) {
       this.left(left);
@@ -38,6 +39,14 @@ public class AConditionalExp extends ScriptNode implements AExpression {
 
    public String op() {
       return this.op;
+   }
+
+   public boolean forceParens() {
+      return this.forceParens;
+   }
+
+   public void forceParens(boolean forceParens) {
+      this.forceParens = forceParens;
    }
 
    @Override
